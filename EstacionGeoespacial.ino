@@ -10,6 +10,7 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include <esp_task_wdt.h>
 
 // ================= PINES ETAPA 1 =================
 #define LORA_SCK   18
@@ -44,17 +45,20 @@
 #define IR_CEN     36
 #define IR_DER     39
 
+// Cambia a true cuando conectes fisicamente el HC-SR04 (evita ruido en pin 34 al aire)
+#define USAR_ULTRASONICO false
+
 // ================= CONSTANTES DE TIEMPO (millis) =================
 const unsigned long INTERVALO_OLED       = 1000;  // Refresco de pantalla cada 1 segundo
 const unsigned long INTERVALO_TELEMETRIA = 3000;  // Envio LoRa y guardado SD cada 3 segundos
 const unsigned long INTERVALO_CONTROL    = 60;    // Lectura HC-SR04 y logica de movimiento
 const unsigned long INTERVALO_RAMPA      = 30;    // Aceleracion suave de motores
-const unsigned long TIMEOUT_MANUAL_MS    = 5000;  // Freno de seguridad en modo MANUAL (cambiar para pruebas de ser necesario)
+const unsigned long TIMEOUT_MANUAL_MS    = 5000;  // Freno de seguridad en modo MANUAL (5s)
 
 const int PASO_RAMPA_NORMAL = 15;
 const int PASO_RAMPA_LINEA  = 60;   // Respuesta rapida en curvas de pista
 const int PASO_RAMPA_GIRO   = 40;   // Giros y esquives
-const int VEL_MAX           = 220;  // Tope PWM (~5.0V efectivos en motores)
+const int VEL_MAX           = 190;  // Topado para proteger motores con pack 2S (~7.4V-8.4V)
 const long DIST_OBSTACULO_CM = 25;
 
 // Navegacion GPS (Calibrar GIRO_GRADOS_POR_SEG en pruebas reales)
@@ -78,26 +82,30 @@ enum EstadoEvasion { EV_AVANZAR, EV_PAUSA, EV_RETROCEDER, EV_GIRAR };
 
 String modoActual = "MANUAL"; // MANUAL, LINEA, OBSTACULO, AUTO
 String ultimaOrden = "Listo";
-bool sdLista   = false;
-bool loraListo = false;
-bool bmpOk     = false;
-bool ahtOk     = false;
-bool rtcOk     = false;
-bool oledOk    = false;
+bool sdLista         = false;
+bool loraListo       = false;
+bool bmpOk           = false;
+bool ahtOk           = false;
+bool rtcOk           = false;
+bool rtcSincronizado = false;
+bool oledOk          = false;
 bool forzarRefrescoOled = false;
 
+// Bufer no bloqueante para lectura por teclado / Monitor Serie
+String serialBuffer = "";
+
 // Temporizadores no bloqueantes
-unsigned long ultimoOledMs       = 0;
-unsigned long ultimaTelemetriaMs = 0;
-unsigned long ultimoControlMs    = 0;
-unsigned long ultimoRampaMs      = 0;
+unsigned long ultimoOledMs        = 0;
+unsigned long ultimaTelemetriaMs  = 0;
+unsigned long ultimoControlMs     = 0;
+unsigned long ultimoRampaMs       = 0;
 unsigned long ultimaOrdenManualMs = 0;
 
 // Cache de lecturas para mostrar en OLED al instante
-float tempCache    = NAN;
-float humCache     = NAN;
-float presionCache = NAN;
-float alturaCache  = NAN;
+float tempCache      = NAN;
+float humCache       = NAN;
+float presionCache   = NAN;
+float alturaCache    = NAN;
 long distanciaActual = 999;
 
 // Control de motores
@@ -134,11 +142,11 @@ int estadoAuto = 0; // 0: iniciar avance, 1: avanzar y medir rumbo, 2: girar
   Nota: Asegurate de tener seleccionada la opcion "Nueva linea" (Newline)
 ===========================================================================
 
---- CONTROL MANUAL (Frena automaticamente tras 2 segundos sin ordenes) ---
-{"cmd":"MOV","dir":"ADELANTE","vel":180}
-{"cmd":"MOV","dir":"ATRAS","vel":180}
-{"cmd":"MOV","dir":"IZQ","vel":180}
-{"cmd":"MOV","dir":"DER","vel":180}
+--- CONTROL MANUAL (Frena automaticamente tras 5 segundos sin ordenes) ---
+{"cmd":"MOV","dir":"ADELANTE","vel":160}
+{"cmd":"MOV","dir":"ATRAS","vel":160}
+{"cmd":"MOV","dir":"IZQ","vel":160}
+{"cmd":"MOV","dir":"DER","vel":160}
 {"cmd":"MOV","dir":"STOP"}
 
 --- CAMBIO DE MODO DE OPERACION ---
@@ -273,6 +281,7 @@ void reiniciarMovimiento() {
 
 // ================= SENSOR ULTRASONICO =================
 long medirDistanciaCm() {
+  if (!USAR_ULTRASONICO) return 999;
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -379,20 +388,19 @@ void dibujarPantallaOLED() {
 
 // ================= MODOS DE CONDUCCION =================
 void ejecutarSeguidorLinea() {
-  // Si tu modulo TCRT5000 funciona al reves, cambia == HIGH por == LOW.
   bool izq = digitalRead(IR_IZQ) == HIGH;
   bool cen = digitalRead(IR_CEN) == HIGH;
   bool der = digitalRead(IR_DER) == HIGH;
 
   if (cen && !izq && !der) {
-    setMotoresObjetivo(150, 150);               // Recto
+    setMotoresObjetivo(150, 150);
   } else if (izq && der) {
-    setMotoresObjetivo(130, 130);               // Cruce / linea ancha
+    setMotoresObjetivo(130, 130);
   } else if (izq) {
-    setMotoresObjetivo(-110, 160);              // Girar izquierda
+    setMotoresObjetivo(-110, 160);
     ultimoLadoLinea = -1;
   } else if (der) {
-    setMotoresObjetivo(160, -110);              // Girar derecha
+    setMotoresObjetivo(160, -110);
     ultimoLadoLinea = 1;
   } else {
     if (ultimoLadoLinea < 0)      setMotoresObjetivo(-110, 140);
@@ -478,7 +486,7 @@ void ejecutarNavegacionAutoGPS(long distObs) {
     case 0:
       prevLat = currLat;
       prevLng = currLng;
-      setMotoresObjetivo(170, 170);
+      setMotoresObjetivo(160, 160);
       timerAutoGps = millis();
       estadoAuto = 1;
       break;
@@ -554,7 +562,7 @@ void procesarComandoJSON(String mensaje, String origen) {
   } else if (cmd == "MOV") {
     String dir = doc["dir"] | "STOP";
     dir.toUpperCase();
-    int vel = abs((int)(doc["vel"] | 180));
+    int vel = abs((int)(doc["vel"] | 160));
 
     bool veniaDeOtroModo = (modoActual != "MANUAL");
     if (veniaDeOtroModo) {
@@ -599,7 +607,6 @@ void procesarComandoJSON(String mensaje, String origen) {
     return;
   }
 
-  // Muestra el comando inmediatamente en la pantalla OLED sin esperar al siguiente segundo
   forzarRefrescoOled = true;
 
   if (registrar) {
@@ -612,8 +619,8 @@ void procesarComandoJSON(String mensaje, String origen) {
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  Serial.setTimeout(20);
 
+  // Motores primero en estado apagado seguro
   pinMode(MOT_IZQ_1, OUTPUT); analogWrite(MOT_IZQ_1, 0);
   pinMode(MOT_IZQ_2, OUTPUT); analogWrite(MOT_IZQ_2, 0);
   pinMode(MOT_DER_1, OUTPUT); analogWrite(MOT_DER_1, 0);
@@ -676,7 +683,7 @@ void setup() {
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (LoRa.begin(433E6)) {
     LoRa.setSyncWord(0xF3);
-    LoRa.enableCrc(); // Importante: activar tambien LoRa.enableCrc() en el Gateway
+    LoRa.enableCrc();
     loraListo = true;
   }
 
@@ -688,17 +695,31 @@ void setup() {
   if (todoOk) {
     iniciarBeep(100, 1);
   } else {
-    iniciarBeep(150, 3); // 3 pitidos no bloqueantes
+    iniciarBeep(150, 3);
   }
 
   actualizarLecturasSensores();
   dibujarPantallaOLED();
-  Serial.println("Robot listo (100% no bloqueante). Envia JSON formato MQTT.");
+
+  // Activar Watchdog por hardware (4s): si el ruido electrico congela el ESP32, se reinicia y frena
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = 4000,
+      .idle_core_mask = 0,
+      .trigger_panic = true
+    };
+    esp_task_wdt_reconfigure(&wdt_config);
+  #else
+    esp_task_wdt_init(4, true);
+  #endif
+  esp_task_wdt_add(NULL);
+
+  Serial.println("Robot listo (con Watchdog anti-bloqueo). Envia JSON formato MQTT.");
 }
 
 // ================= LOOP =================
 void loop() {
-  unsigned long ahora = millis();
+  esp_task_wdt_reset(); // Alimenta el Watchdog en cada ciclo sano
 
   // 0. Actualizar sonido del buzzer sin bloquear
   actualizarBuzzer();
@@ -708,14 +729,15 @@ void loop() {
     gps.encode(gpsSerial.read());
   }
 
-  // Respaldo: sincronizar RTC con satelites GPS si perdio la hora
-  if (rtcOk && gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2026) {
+  // Respaldo: sincronizar RTC con GPS UNA sola vez para no saturar el bus I2C
+  if (rtcOk && !rtcSincronizado && gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2026) {
     DateTime now = rtc.now();
     if (now.year() < 2026) {
       DateTime gpsUTC(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
       rtc.adjust(gpsUTC - TimeSpan(0, 6, 0, 0)); // Hora local Colima (UTC-6)
     }
+    rtcSincronizado = true;
   }
 
   // 2A. Comandos por LoRa
@@ -728,20 +750,28 @@ void loop() {
     }
   }
 
-  // 2B. Comandos por Teclado / Monitor Serie (simula MQTT)
-  if (Serial.available() > 0) {
-    String serialData = Serial.readStringUntil('\n');
-    serialData.trim();
-    if (serialData.length() > 0) {
-      procesarComandoJSON(serialData, "PC-MQTT");
+  // 2B. Comandos por Teclado / Monitor Serie (100% no bloqueante)
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      serialBuffer.trim();
+      if (serialBuffer.length() > 0) {
+        procesarComandoJSON(serialBuffer, "PC-MQTT");
+      }
+      serialBuffer = "";
+    } else if (c != '\r') {
+      if (serialBuffer.length() < 250) {
+        serialBuffer += c;
+      } else {
+        serialBuffer = ""; // Descarta linea corrupta por ruido USB
+      }
     }
   }
 
   // 3. Control de locomocion (cada 60 ms)
   static long lecturas[3] = {999, 999, 999};
   static int idxLectura = 0;
-
-  ahora = millis(); // <-- Actualiza el reloj despues de leer Serial y LoRa
+  unsigned long ahora = millis();
 
   if (ahora - ultimoControlMs >= INTERVALO_CONTROL) {
     ultimoControlMs = ahora;
