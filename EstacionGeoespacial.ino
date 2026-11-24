@@ -36,40 +36,45 @@
 #define MOT_DER_1  15
 #define MOT_DER_2   2
 
-// Ultrasonico HC-SR04 (Usar divisor de voltaje en ECHO para bajar 5V a 3.3V)
+// Ultrasonico HC-SR04 (Divisor 2k + 4k en ECHO hacia GPIO 34)
 #define TRIG_PIN   33
 #define ECHO_PIN   34
 
-// Seguidor de linea TCRT5000 (S2=Izq, S4=Centro, S7=Der)
+// Seguidor de linea TCRT5000
 #define IR_IZQ     35
 #define IR_CEN     36
 #define IR_DER     39
 
-// Cambia a true cuando conectes fisicamente el HC-SR04 (evita ruido en pin 34 al aire)
-#define USAR_ULTRASONICO false
+// ACTIVADO: Divisor de voltaje instalado en GPIO 34
+#define USAR_ULTRASONICO true
 
-// ================= CONSTANTES DE TIEMPO (millis) =================
-const unsigned long INTERVALO_OLED       = 1000;  // Refresco de pantalla cada 1 segundo
-const unsigned long INTERVALO_TELEMETRIA = 3000;  // Envio LoRa y guardado SD cada 3 segundos
-const unsigned long INTERVALO_CONTROL    = 60;    // Lectura HC-SR04 y logica de movimiento
-const unsigned long INTERVALO_RAMPA      = 30;    // Aceleracion suave de motores
-const unsigned long TIMEOUT_MANUAL_MS    = 5000;  // Freno de seguridad en modo MANUAL (5s)
+// ================= CONSTANTES DE TIEMPO Y CALIBRACION =================
+const unsigned long INTERVALO_OLED       = 1000;
+const unsigned long INTERVALO_TELEMETRIA = 3000;
+const unsigned long INTERVALO_CONTROL    = 60;
+const unsigned long INTERVALO_RAMPA      = 30;
+const unsigned long TIMEOUT_MANUAL_MS    = 5000;
 
-const int PASO_RAMPA_NORMAL = 15;
-const int PASO_RAMPA_LINEA  = 60;   // Respuesta rapida en curvas de pista
-const int PASO_RAMPA_GIRO   = 40;   // Giros y esquives
-const int VEL_MAX           = 190;  // Topado para proteger motores con pack 2S (~7.4V-8.4V)
+const int PASO_RAMPA_NORMAL = 20;
+const int PASO_RAMPA_LINEA  = 70;
+const int PASO_RAMPA_GIRO   = 120;  // Respuesta casi inmediata para vencer friccion lateral
+const int VEL_MAX           = 235;  // Permite torque extra en giros sobre su eje
+const int VEL_AVANCE        = 175;  // Velocidad crucero segura (~5.5V efectivos)
+const int VEL_GIRO          = 225;  // Potencia alta para girar las 4 llantas fijas
 const long DIST_OBSTACULO_CM = 25;
 
-// Navegacion GPS (Calibrar GIRO_GRADOS_POR_SEG en pruebas reales)
+// CALIBRAR ESTOS TIEMPOS EN EL PISO REAL PARA EL MODO "CIRCUITO" Y GIROS:
+const unsigned long TIEMPO_1M_MS       = 2200; // ms que tarda en avanzar 1 metro a VEL_AVANCE
+const unsigned long TIEMPO_GIRO_90_MS  = 550;  // ms que tarda en girar 90 grados a VEL_GIRO
+const unsigned long TIEMPO_GIRO_180_MS = 1100; // ms que tarda en girar 180 grados a VEL_GIRO
+
+// Navegacion GPS y Mapa de Memoria (Grid)
 const double RADIO_META_M             = 3.0;
-const double DIST_MIN_RUMBO_M         = 3.0;
+const double DIST_MIN_RUMBO_M         = 2.0;
 const unsigned long TIMEOUT_AVANCE_MS = 15000;
-const double GIRO_GRADOS_POR_SEG      = 120.0;
 const unsigned long GPS_MAX_EDAD_MS   = 2000;
 
 // ================= OBJETOS =================
-// Forzar 100 kHz en OLED para convivir sin bloqueos con el reloj RTC DS1307
 Adafruit_SSD1306 display(128, 64, &Wire, -1, 100000UL, 100000UL);
 Adafruit_BMP280 bmp;
 Adafruit_AHTX0 aht;
@@ -80,7 +85,7 @@ HardwareSerial gpsSerial(2);
 // ================= ESTADO DEL SISTEMA =================
 enum EstadoEvasion { EV_AVANZAR, EV_PAUSA, EV_RETROCEDER, EV_GIRAR };
 
-String modoActual = "MANUAL"; // MANUAL, LINEA, OBSTACULO, AUTO
+String modoActual = "MANUAL"; // MANUAL, LINEA, OBSTACULO, AUTO, CIRCUITO, TEST_MOTORES
 String ultimaOrden = "Listo";
 bool sdLista         = false;
 bool loraListo       = false;
@@ -91,7 +96,6 @@ bool rtcSincronizado = false;
 bool oledOk          = false;
 bool forzarRefrescoOled = false;
 
-// Bufer no bloqueante para lectura por teclado / Monitor Serie
 String serialBuffer = "";
 
 // Temporizadores no bloqueantes
@@ -101,12 +105,13 @@ unsigned long ultimoControlMs     = 0;
 unsigned long ultimoRampaMs       = 0;
 unsigned long ultimaOrdenManualMs = 0;
 
-// Cache de lecturas para mostrar en OLED al instante
+// Cache de sensores
 float tempCache      = NAN;
 float humCache       = NAN;
 float presionCache   = NAN;
 float alturaCache    = NAN;
 long distanciaActual = 999;
+bool objetoDetectadoPrev = false;
 
 // Control de motores
 int velActualIzq = 0, velActualDer = 0;
@@ -125,46 +130,62 @@ int beepsRestantes = 0;
 EstadoEvasion estadoEv = EV_AVANZAR;
 unsigned long timerEv = 0;
 
-// Seguidor de linea
-int ultimoLadoLinea = 0; // -1 izquierda, +1 derecha, 0 desconocido
+// Modo CIRCUITO de prueba
+int pasoCircuito = 0;
+unsigned long timerCircuito = 0;
 
-// Navegacion GPS
+// Seguidor de linea
+int ultimoLadoLinea = 0;
+
+// Navegacion GPS + Memoria de Celdas Visitadas (Evita repetir caminos fallidos)
 bool destinoActivo = false;
 double targetLat = 0.0, targetLng = 0.0;
+double origenLat = 0.0, origenLng = 0.0;
+bool origenFijado = false;
 double prevLat = 0.0, prevLng = 0.0;
 unsigned long timerAutoGps = 0;
 unsigned long duracionGiro = 0;
-int estadoAuto = 0; // 0: iniciar avance, 1: avanzar y medir rumbo, 2: girar
+int estadoAuto = 0;
+
+// Cuadricula de memoria 21x21 celdas (cada celda = 1.5m x 1.5m alrededor del inicio)
+// Valor 0 = libre/no visitada, 1..10 = veces visitada (penalizacion), 255 = obstaculo/callejon
+const int GRID_SIZE = 21;
+const double CELDA_M = 1.5;
+uint8_t mapaCosto[GRID_SIZE][GRID_SIZE];
 
 /*
 ===========================================================================
-  COMANDOS JSON (FORMATO MQTT) PARA EL MONITOR SERIE (115200 baudios)
-  Nota: Asegurate de tener seleccionada la opcion "Nueva linea" (Newline)
+  COMANDOS JSON (MONITOR SERIE 115200 baudios - "Nueva linea")
 ===========================================================================
+--- PRUEBA DE GIROS EXACTOS Y REVERSA ---
+{"cmd":"GIRO","grados":-90}    -> Gira 90 grados a la izquierda
+{"cmd":"GIRO","grados":90}     -> Gira 90 grados a la derecha
+{"cmd":"GIRO","grados":180}    -> Gira 180 grados
+{"cmd":"MOV","dir":"ATRAS","vel":180}
 
---- CONTROL MANUAL (Frena automaticamente tras 5 segundos sin ordenes) ---
-{"cmd":"MOV","dir":"ADELANTE","vel":160}
-{"cmd":"MOV","dir":"ATRAS","vel":160}
-{"cmd":"MOV","dir":"IZQ","vel":160}
-{"cmd":"MOV","dir":"DER","vel":160}
-{"cmd":"MOV","dir":"STOP"}
+--- EJECUTAR CIRCUITO DE PRUEBA (1m -> 90° izq -> 1m -> 180° -> STOP) ---
+{"cmd":"MODO","val":"CIRCUITO"}
 
---- CAMBIO DE MODO DE OPERACION ---
-{"cmd":"MODO","val":"MANUAL"}
-{"cmd":"MODO","val":"LINEA"}
-{"cmd":"MODO","val":"OBSTACULO"}
-{"cmd":"MODO","val":"AUTO"}
-
---- NAVEGACION AUTONOMA GPS (Ejemplo con coordenadas de Colima) ---
+--- NAVEGACION CON MEMORIA DE CAMINOS ---
 {"cmd":"GOTO","lat":19.2438,"lng":-103.7251}
-
 ===========================================================================
 */
 
-// ================= AUXILIARES NO BLOQUEANTES =================
+// ================= LED ANODO COMUN (LOW ENCIENDE, HIGH APAGA) =================
 void setLed(bool r, bool g) {
-  digitalWrite(LED_R, r);
-  digitalWrite(LED_G, g);
+  digitalWrite(LED_R, !r);
+  digitalWrite(LED_G, !g);
+}
+
+void actualizarLedEstado() {
+  // Prioridad 1: Si el ultrasonico detecta objeto <= 25 cm -> AMARILLO (Rojo + Verde)
+  if (USAR_ULTRASONICO && distanciaActual <= DIST_OBSTACULO_CM) {
+    setLed(true, true);
+    return;
+  }
+  // Estado normal: Verde si SD y LoRa OK, Rojo si falta alguno
+  bool todoOk = sdLista && loraListo;
+  setLed(!todoOk, todoOk);
 }
 
 void iniciarBeep(int duracionMs, int repeticiones = 1) {
@@ -210,7 +231,7 @@ bool gpsConFix() {
 }
 
 bool modoValido(const String &m) {
-  return m == "MANUAL" || m == "LINEA" || m == "OBSTACULO" || m == "AUTO";
+  return m == "MANUAL" || m == "LINEA" || m == "OBSTACULO" || m == "AUTO" || m == "CIRCUITO";
 }
 
 double normalizarAngulo(double a) {
@@ -276,6 +297,7 @@ void reiniciarMovimiento() {
   destinoActivo = false;
   estadoAuto = 0;
   estadoEv = EV_AVANZAR;
+  pasoCircuito = 0;
   ultimoLadoLinea = 0;
 }
 
@@ -287,12 +309,13 @@ long medirDistanciaCm() {
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  unsigned long duracion = pulseIn(ECHO_PIN, HIGH, 12000); // Timeout 12 ms (~2 m max)
+  unsigned long duracion = pulseIn(ECHO_PIN, HIGH, 15000);
   if (duracion == 0) return 999;
-  return (long)(duracion * 0.034 / 2);
+  long cm = (long)(duracion * 0.034 / 2);
+  return (cm < 2) ? 999 : cm;
 }
 
-// ================= MATEMATICAS GPS =================
+// ================= MATEMATICAS GPS Y MAPA DE MEMORIA =================
 double calcularDistanciaM(double lat1, double lon1, double lat2, double lon2) {
   const double R = 6371000.0;
   double dLat = radians(lat2 - lat1);
@@ -309,6 +332,43 @@ double calcularRumboDeg(double lat1, double lon1, double lat2, double lon2) {
              sin(radians(lat1)) * cos(radians(lat2)) * cos(dLon);
   double brng = degrees(atan2(y, x));
   return fmod((brng + 360.0), 360.0);
+}
+
+void limpiarMapaMemoria() {
+  memset(mapaCosto, 0, sizeof(mapaCosto));
+  origenFijado = false;
+}
+
+// Convierte coordenada GPS a celda (gx, gy) y registra penalizacion por visita o bloqueo
+void registrarCeldaMapa(double lat, double lng, bool esBloqueo) {
+  if (!origenFijado) {
+    origenLat = lat;
+    origenLng = lng;
+    origenFijado = true;
+  }
+  double dy = (lat - origenLat) * 111320.0;
+  double dx = (lng - origenLng) * 111320.0 * cos(radians(origenLat));
+  int gx = constrain((int)round(dx / CELDA_M) + GRID_SIZE / 2, 0, GRID_SIZE - 1);
+  int gy = constrain((int)round(dy / CELDA_M) + GRID_SIZE / 2, 0, GRID_SIZE - 1);
+
+  if (esBloqueo) {
+    mapaCosto[gx][gy] = 255; // Celda bloqueada: no volver a intentar por aqui
+  } else if (mapaCosto[gx][gy] < 200) {
+    mapaCosto[gx][gy] += 2;  // Penaliza caminos ya recorridos para preferir rutas nuevas
+  }
+}
+
+uint8_t consultarCostoSiguienteCelda(double lat, double lng, double rumboDeg) {
+  if (!origenFijado) return 0;
+  double rad = radians(rumboDeg);
+  double sigLat = lat + (CELDA_M * cos(rad)) / 111320.0;
+  double sigLng = lng + (CELDA_M * sin(rad)) / (111320.0 * cos(radians(lat)));
+
+  double dy = (sigLat - origenLat) * 111320.0;
+  double dx = (sigLng - origenLng) * 111320.0 * cos(radians(origenLat));
+  int gx = constrain((int)round(dx / CELDA_M) + GRID_SIZE / 2, 0, GRID_SIZE - 1);
+  int gy = constrain((int)round(dy / CELDA_M) + GRID_SIZE / 2, 0, GRID_SIZE - 1);
+  return mapaCosto[gx][gy];
 }
 
 // ================= DATALOGGER Y OLED =================
@@ -386,6 +446,95 @@ void dibujarPantallaOLED() {
   display.display();
 }
 
+// ================= MODO CIRCUITO DE PRUEBA =================
+// Secuencia: 1m adelante -> gira 90 izq -> 1m adelante -> gira 180 -> detente
+void ejecutarCircuitoPrueba(long distObs) {
+  if (distObs <= DIST_OBSTACULO_CM && pasoCircuito < 7) {
+    detenerInmediato();
+    ultimaOrden = "CIRC:OBSTACULO!";
+    forzarRefrescoOled = true;
+    modoActual = "MANUAL";
+    iniciarBeep(200, 2);
+    return;
+  }
+
+  pasoRampa = PASO_RAMPA_GIRO;
+
+  switch (pasoCircuito) {
+    case 0: // Iniciar tramo 1 (1m adelante)
+      ultimaOrden = "CIRC:1/4 1m Adel";
+      forzarRefrescoOled = true;
+      setMotoresObjetivo(VEL_AVANCE, VEL_AVANCE);
+      timerCircuito = millis();
+      pasoCircuito = 1;
+      break;
+
+    case 1:
+      if (millis() - timerCircuito >= TIEMPO_1M_MS) {
+        detenerInmediato();
+        timerCircuito = millis();
+        pasoCircuito = 2;
+      }
+      break;
+
+    case 2: // Pausa breve de estabilizacion
+      if (millis() - timerCircuito >= 250) {
+        ultimaOrden = "CIRC:2/4 Giro 90I";
+        forzarRefrescoOled = true;
+        setMotoresObjetivo(-VEL_GIRO, VEL_GIRO); // Giro sobre eje a la izquierda
+        timerCircuito = millis();
+        pasoCircuito = 3;
+      }
+      break;
+
+    case 3:
+      if (millis() - timerCircuito >= TIEMPO_GIRO_90_MS) {
+        detenerInmediato();
+        timerCircuito = millis();
+        pasoCircuito = 4;
+      }
+      break;
+
+    case 4: // Pausa breve y arranque tramo 2 (1m adelante)
+      if (millis() - timerCircuito >= 250) {
+        ultimaOrden = "CIRC:3/4 1m Adel";
+        forzarRefrescoOled = true;
+        setMotoresObjetivo(VEL_AVANCE, VEL_AVANCE);
+        timerCircuito = millis();
+        pasoCircuito = 5;
+      }
+      break;
+
+    case 5:
+      if (millis() - timerCircuito >= TIEMPO_1M_MS) {
+        detenerInmediato();
+        timerCircuito = millis();
+        pasoCircuito = 6;
+      }
+      break;
+
+    case 6: // Giro 180 grados
+      if (millis() - timerCircuito >= 250) {
+        ultimaOrden = "CIRC:4/4 Giro 180";
+        forzarRefrescoOled = true;
+        setMotoresObjetivo(VEL_GIRO, -VEL_GIRO); // Giro 180 sobre eje
+        timerCircuito = millis();
+        pasoCircuito = 7;
+      }
+      break;
+
+    case 7:
+      if (millis() - timerCircuito >= TIEMPO_GIRO_180_MS) {
+        detenerInmediato();
+        ultimaOrden = "CIRC:FIN!";
+        forzarRefrescoOled = true;
+        modoActual = "MANUAL";
+        iniciarBeep(300, 1);
+      }
+      break;
+  }
+}
+
 // ================= MODOS DE CONDUCCION =================
 void ejecutarSeguidorLinea() {
   bool izq = digitalRead(IR_IZQ) == HIGH;
@@ -397,15 +546,15 @@ void ejecutarSeguidorLinea() {
   } else if (izq && der) {
     setMotoresObjetivo(130, 130);
   } else if (izq) {
-    setMotoresObjetivo(-110, 160);
+    setMotoresObjetivo(-140, 190);
     ultimoLadoLinea = -1;
   } else if (der) {
-    setMotoresObjetivo(160, -110);
+    setMotoresObjetivo(190, -140);
     ultimoLadoLinea = 1;
   } else {
-    if (ultimoLadoLinea < 0)      setMotoresObjetivo(-110, 140);
-    else if (ultimoLadoLinea > 0) setMotoresObjetivo(140, -110);
-    else                          setMotoresObjetivo(110, 110);
+    if (ultimoLadoLinea < 0)      setMotoresObjetivo(-140, 170);
+    else if (ultimoLadoLinea > 0) setMotoresObjetivo(170, -140);
+    else                          setMotoresObjetivo(120, 120);
   }
 }
 
@@ -414,30 +563,31 @@ void ejecutarEvitadorObstaculos(long dist) {
   switch (estadoEv) {
     case EV_AVANZAR:
       if (dist > DIST_OBSTACULO_CM) {
-        setMotoresObjetivo(160, 160);
+        setMotoresObjetivo(VEL_AVANCE, VEL_AVANCE);
       } else {
         detenerInmediato();
         registrarEvento("Obstaculo a " + String(dist) + " cm");
+        if (gpsConFix()) registrarCeldaMapa(gps.location.lat(), gps.location.lng(), true);
         estadoEv = EV_PAUSA;
         timerEv = millis();
       }
       break;
     case EV_PAUSA:
       if (millis() - timerEv >= 150) {
-        setMotoresObjetivo(-150, -150);
+        setMotoresObjetivo(-VEL_AVANCE, -VEL_AVANCE);
         estadoEv = EV_RETROCEDER;
         timerEv = millis();
       }
       break;
     case EV_RETROCEDER:
-      if (millis() - timerEv >= 500) {
-        setMotoresObjetivo(160, -160);
+      if (millis() - timerEv >= 450) {
+        setMotoresObjetivo(VEL_GIRO, -VEL_GIRO);
         estadoEv = EV_GIRAR;
         timerEv = millis();
       }
       break;
     case EV_GIRAR:
-      if (millis() - timerEv >= 600) {
+      if (millis() - timerEv >= TIEMPO_GIRO_90_MS) {
         detenerInmediato();
         estadoEv = EV_AVANZAR;
       }
@@ -486,7 +636,8 @@ void ejecutarNavegacionAutoGPS(long distObs) {
     case 0:
       prevLat = currLat;
       prevLng = currLng;
-      setMotoresObjetivo(160, 160);
+      registrarCeldaMapa(currLat, currLng, false);
+      setMotoresObjetivo(VEL_AVANCE, VEL_AVANCE);
       timerAutoGps = millis();
       estadoAuto = 1;
       break;
@@ -494,24 +645,46 @@ void ejecutarNavegacionAutoGPS(long distObs) {
     case 1: {
       double recorrido = calcularDistanciaM(prevLat, prevLng, currLat, currLng);
       if (recorrido >= DIST_MIN_RUMBO_M) {
+        registrarCeldaMapa(currLat, currLng, false);
         double rumboActual = calcularRumboDeg(prevLat, prevLng, currLat, currLng);
         double rumboMeta   = calcularRumboDeg(currLat, currLng, targetLat, targetLng);
-        double err = normalizarAngulo(rumboMeta - rumboActual);
+
+        // Evaluar 3 rumbos candidatos (-60 izq, 0 directo, +60 der) combinando meta + memoria
+        double mejorRumbo = rumboMeta;
+        double mejorScore = 999999.0;
+        double candidatos[3] = {
+          fmod(rumboMeta + 360.0, 360.0),
+          fmod(rumboMeta - 60.0 + 360.0, 360.0),
+          fmod(rumboMeta + 60.0 + 360.0, 360.0)
+        };
+
+        for (int i = 0; i < 3; i++) {
+          uint8_t costoCelda = consultarCostoSiguienteCelda(currLat, currLng, candidatos[i]);
+          double penalizacionAngulo = (i == 0) ? 0.0 : 15.0;
+          double score = (costoCelda * 25.0) + penalizacionAngulo;
+          if (score < mejorScore) {
+            mejorScore = score;
+            mejorRumbo = candidatos[i];
+          }
+        }
+
+        double err = normalizarAngulo(mejorRumbo - rumboActual);
 
         if (fabs(err) < 20.0) {
           prevLat = currLat;
           prevLng = currLng;
           timerAutoGps = millis();
         } else {
-          duracionGiro = (unsigned long)constrain((long)(fabs(err) / GIRO_GRADOS_POR_SEG * 1000.0), 150L, 1500L);
+          duracionGiro = (unsigned long)constrain((long)(fabs(err) / 90.0 * TIEMPO_GIRO_90_MS), 180L, TIEMPO_GIRO_180_MS);
           pasoRampa = PASO_RAMPA_GIRO;
-          if (err > 0) setMotoresObjetivo(160, -160);
-          else         setMotoresObjetivo(-160, 160);
+          if (err > 0) setMotoresObjetivo(VEL_GIRO, -VEL_GIRO);
+          else         setMotoresObjetivo(-VEL_GIRO, VEL_GIRO);
           timerAutoGps = millis();
           estadoAuto = 2;
         }
       } else if (millis() - timerAutoGps >= TIMEOUT_AVANCE_MS) {
-        ultimaOrden = "AUTO:Sin avance";
+        registrarCeldaMapa(currLat, currLng, true); // Marca zona sin avance como bloqueada
+        ultimaOrden = "AUTO:Re-enrutando";
         forzarRefrescoOled = true;
         prevLat = currLat;
         prevLng = currLng;
@@ -530,7 +703,7 @@ void ejecutarNavegacionAutoGPS(long distObs) {
   }
 }
 
-// ================= COMANDOS JSON (LoRa / Teclado MQTT) =================
+// ================= COMANDOS JSON =================
 void procesarComandoJSON(String mensaje, String origen) {
   mensaje.trim();
   if (mensaje.length() == 0) return;
@@ -562,14 +735,12 @@ void procesarComandoJSON(String mensaje, String origen) {
   } else if (cmd == "MOV") {
     String dir = doc["dir"] | "STOP";
     dir.toUpperCase();
-    int vel = abs((int)(doc["vel"] | 160));
+    int vel = abs((int)(doc["vel"] | VEL_AVANCE));
 
     bool veniaDeOtroModo = (modoActual != "MANUAL");
     if (veniaDeOtroModo) {
       modoActual = "MANUAL";
-      destinoActivo = false;
-      estadoAuto = 0;
-      estadoEv = EV_AVANZAR;
+      reiniciarMovimiento();
     }
 
     String nueva = "MOV:" + dir;
@@ -581,9 +752,23 @@ void procesarComandoJSON(String mensaje, String origen) {
 
     if (dir == "ADELANTE")      setMotoresObjetivo(vel, vel);
     else if (dir == "ATRAS")    setMotoresObjetivo(-vel, -vel);
-    else if (dir == "IZQ")      setMotoresObjetivo(-vel, vel);
-    else if (dir == "DER")      setMotoresObjetivo(vel, -vel);
+    else if (dir == "IZQ")      setMotoresObjetivo(-VEL_GIRO, VEL_GIRO);
+    else if (dir == "DER")      setMotoresObjetivo(VEL_GIRO, -VEL_GIRO);
     else                        setMotoresObjetivo(0, 0);
+
+  } else if (cmd == "GIRO") {
+    // Comando rapido para calibrar giros exactos: {"cmd":"GIRO","grados":90} o -90 o 180
+    int grados = doc["grados"] | 90;
+    modoActual = "MANUAL";
+    reiniciarMovimiento();
+    pasoRampa = PASO_RAMPA_GIRO;
+    unsigned long tGiro = (unsigned long)(abs(grados) / 90.0 * TIEMPO_GIRO_90_MS);
+    ultimaOrden = "GIRO:" + String(grados) + "g";
+    detalleLog = ultimaOrden;
+    // Usamos TIMEOUT_MANUAL_MS ajustado al tiempo exacto del giro
+    ultimaOrdenManualMs = millis() - (TIMEOUT_MANUAL_MS - tGiro);
+    if (grados > 0) setMotoresObjetivo(VEL_GIRO, -VEL_GIRO);
+    else            setMotoresObjetivo(-VEL_GIRO, VEL_GIRO);
 
   } else if (cmd == "GOTO") {
     double lat = doc["lat"] | 0.0;
@@ -593,6 +778,7 @@ void procesarComandoJSON(String mensaje, String origen) {
       Serial.println("[" + origen + "] GOTO invalido");
       return;
     }
+    limpiarMapaMemoria();
     targetLat = lat;
     targetLng = lng;
     modoActual = "AUTO";
@@ -620,7 +806,6 @@ void procesarComandoJSON(String mensaje, String origen) {
 void setup() {
   Serial.begin(115200);
 
-  // Motores primero en estado apagado seguro
   pinMode(MOT_IZQ_1, OUTPUT); analogWrite(MOT_IZQ_1, 0);
   pinMode(MOT_IZQ_2, OUTPUT); analogWrite(MOT_IZQ_2, 0);
   pinMode(MOT_DER_1, OUTPUT); analogWrite(MOT_DER_1, 0);
@@ -635,9 +820,8 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
-  setLed(1, 0);
+  setLed(true, false); // Rojo puro al iniciar (anodo comun)
 
-  // Bus I2C a 100 kHz con timeout de 50 ms para evitar congelamientos
   Wire.begin(21, 22);
   Wire.setClock(100000);
   Wire.setTimeOut(50);
@@ -690,9 +874,8 @@ void setup() {
   Serial.println(String("SD: ") + (sdLista ? "OK" : "ERROR") +
                  " | LoRa: " + (loraListo ? "OK" : "ERROR"));
 
-  bool todoOk = sdLista && loraListo;
-  setLed(!todoOk, todoOk);
-  if (todoOk) {
+  actualizarLedEstado();
+  if (sdLista && loraListo) {
     iniciarBeep(100, 1);
   } else {
     iniciarBeep(150, 3);
@@ -701,7 +884,6 @@ void setup() {
   actualizarLecturasSensores();
   dibujarPantallaOLED();
 
-  // Activar Watchdog por hardware (4s): si el ruido electrico congela el ESP32, se reinicia y frena
   #if ESP_ARDUINO_VERSION_MAJOR >= 3
     esp_task_wdt_config_t wdt_config = {
       .timeout_ms = 4000,
@@ -714,33 +896,29 @@ void setup() {
   #endif
   esp_task_wdt_add(NULL);
 
-  Serial.println("Robot listo (con Watchdog anti-bloqueo). Envia JSON formato MQTT.");
+  Serial.println("Robot listo. Ultrasonico ACTIVO (LED Amarillo <= 25cm).");
 }
 
 // ================= LOOP =================
 void loop() {
-  esp_task_wdt_reset(); // Alimenta el Watchdog en cada ciclo sano
+  esp_task_wdt_reset();
 
-  // 0. Actualizar sonido del buzzer sin bloquear
   actualizarBuzzer();
 
-  // 1. Lectura continua GPS
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
 
-  // Respaldo: sincronizar RTC con GPS UNA sola vez para no saturar el bus I2C
   if (rtcOk && !rtcSincronizado && gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2026) {
     DateTime now = rtc.now();
     if (now.year() < 2026) {
       DateTime gpsUTC(gps.date.year(), gps.date.month(), gps.date.day(),
                       gps.time.hour(), gps.time.minute(), gps.time.second());
-      rtc.adjust(gpsUTC - TimeSpan(0, 6, 0, 0)); // Hora local Colima (UTC-6)
+      rtc.adjust(gpsUTC - TimeSpan(0, 6, 0, 0));
     }
     rtcSincronizado = true;
   }
 
-  // 2A. Comandos por LoRa
   if (loraListo) {
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
@@ -750,7 +928,6 @@ void loop() {
     }
   }
 
-  // 2B. Comandos por Teclado / Monitor Serie (100% no bloqueante)
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n') {
@@ -763,12 +940,12 @@ void loop() {
       if (serialBuffer.length() < 250) {
         serialBuffer += c;
       } else {
-        serialBuffer = ""; // Descarta linea corrupta por ruido USB
+        serialBuffer = "";
       }
     }
   }
 
-  // 3. Control de locomocion (cada 60 ms)
+  // 3. Control de locomocion y lectura ultrasonica (cada 60 ms)
   static long lecturas[3] = {999, 999, 999};
   static int idxLectura = 0;
   unsigned long ahora = millis();
@@ -780,18 +957,35 @@ void loop() {
     idxLectura = (idxLectura + 1) % 3;
     distanciaActual = medianaDe3(lecturas[0], lecturas[1], lecturas[2]);
 
+    // Actualizar LED (Amarillo si detecta objeto <= 25 cm) y avisar en consola
+    bool detectadoAhora = (USAR_ULTRASONICO && distanciaActual <= DIST_OBSTACULO_CM);
+    if (detectadoAhora != objetoDetectadoPrev) {
+      objetoDetectadoPrev = detectadoAhora;
+      actualizarLedEstado();
+      forzarRefrescoOled = true;
+      if (detectadoAhora) {
+        Serial.println("[ULTRASONICO] Objeto detectado a " + String(distanciaActual) + " cm -> LED AMARILLO");
+      } else {
+        Serial.println("[ULTRASONICO] Via libre (" + String(distanciaActual) + " cm)");
+      }
+    }
+
     if (modoActual == "LINEA")          pasoRampa = PASO_RAMPA_LINEA;
-    else if (modoActual == "OBSTACULO") pasoRampa = PASO_RAMPA_GIRO;
+    else if (modoActual == "OBSTACULO" || modoActual == "CIRCUITO") pasoRampa = PASO_RAMPA_GIRO;
     else                                pasoRampa = PASO_RAMPA_NORMAL;
 
     if (modoActual == "MANUAL") {
       if (millis() - ultimaOrdenManualMs > TIMEOUT_MANUAL_MS) {
         setMotoresObjetivo(0, 0);
-        if (ultimaOrden.startsWith("MOV:") && ultimaOrden != "MOV:STOP") {
-          ultimaOrden = "MOV:STOP";
-          forzarRefrescoOled = true;
+        if (ultimaOrden.startsWith("MOV:") || ultimaOrden.startsWith("GIRO:")) {
+          if (ultimaOrden != "MOV:STOP") {
+            ultimaOrden = "MOV:STOP";
+            forzarRefrescoOled = true;
+          }
         }
       }
+    } else if (modoActual == "CIRCUITO") {
+      ejecutarCircuitoPrueba(distanciaActual);
     } else if (modoActual == "LINEA") {
       ejecutarSeguidorLinea();
     } else if (modoActual == "OBSTACULO") {
@@ -801,13 +995,11 @@ void loop() {
     }
   }
 
-  // Rampa suave de aceleracion PWM (cada 30 ms)
   if (ahora - ultimoRampaMs >= INTERVALO_RAMPA) {
     ultimoRampaMs = ahora;
     actualizarMotoresSuave();
   }
 
-  // 4A. Actualizacion de sensores y pantalla OLED cada 1 segundo (o inmediato por evento)
   if (ahora - ultimoOledMs >= INTERVALO_OLED) {
     ultimoOledMs = ahora;
     actualizarLecturasSensores();
@@ -818,7 +1010,6 @@ void loop() {
     forzarRefrescoOled = false;
   }
 
-  // 4B. Telemetria LoRa y guardado en MicroSD cada 3 segundos
   if (ahora - ultimaTelemetriaMs >= INTERVALO_TELEMETRIA) {
     ultimaTelemetriaMs = ahora;
 
@@ -863,11 +1054,11 @@ void loop() {
       String payload;
       serializeJson(txDoc, payload);
 
-      setLed(1, 1);
+      setLed(true, true);
       LoRa.beginPacket();
       LoRa.print(payload);
       LoRa.endPacket();
-      setLed(!(sdLista && loraListo), (sdLista && loraListo));
+      actualizarLedEstado();
     }
   }
 }
