@@ -40,10 +40,10 @@
 #define TRIG_PIN   33
 #define ECHO_PIN   34
 
-// Seguidor de linea TCRT5000 (2 sensores separados ~3.5 cm: Izq en GPIO 35, Der en GPIO 36)
+// Seguidor de linea TCRT5000 (3 sensores: Izq=35, Centro(nuevo)=39, Der=36)
 #define IR_IZQ     35
-#define IR_CEN     36
-#define IR_DER     39
+#define IR_CEN     39
+#define IR_DER     36
 
 // ACTIVADO: Divisor de voltaje instalado en GPIO 34
 #define USAR_ULTRASONICO true
@@ -69,32 +69,34 @@ const int VEL_MAX               = 160;  // Tope maximo general
 const int VEL_AVANCE            = 120;  // Velocidad base inicial en modo MANUAL / AUTO / CIRCUITO
 const int VEL_GIRO              = 160;  // Velocidad de giro sobre su eje
 
-// Velocidades y tiempos calibrados para modo LINEA (sensores separados ~3.5 cm + Kickstart)
-const int VEL_LINEA_RECTO                 = 62;
-const int VEL_LINEA_GIRO_EXT              = 160;
-const int VEL_LINEA_GIRO_INT              = -110;
-const int VEL_KICKSTART_LINEA             = 120;
+// Velocidades y tiempos calibrados para modo LINEA con 3 sensores + Kickstart
+const int VEL_LINEA_RECTO                 = 75;   // Mas estable y rapido gracias al sensor central
+const int VEL_LINEA_SUAVE_EXT             = 145;  // Correccion suave cuando detectan CEN + lateral
+const int VEL_LINEA_SUAVE_INT             = 0;    // Frena rueda interior sin contragiro brusco
+const int VEL_LINEA_GIRO_EXT              = 160;  // Maxima potencia en rueda exterior en curva cerrada
+const int VEL_LINEA_GIRO_INT              = -110; // Contragiro firme cuando solo ve sensor lateral
+const int VEL_KICKSTART_LINEA             = 120;  // Pulso inicial para romper friccion estatica
 const unsigned long DURACION_KICKSTART_MS = 95;
 const unsigned long RETENCION_CURVA_MS    = 310;
 
 // Velocidades y umbrales para modo OBSTACULO ({90°, 135°} + micro-barrido +-20°)
-const int VEL_OBS_NORMAL        = 95;   // Crucero cuando dist >= 100 cm
-const int VEL_OBS_MINIMA        = 65;   // Velocidad minima de aproximacion cerca de 25 cm
-const long DIST_DESPEJADO_CM    = 100;  // Inicia desaceleracion proporcional
-const long DIST_OBSTACULO_CM    = 25;   // Detencion total
-const long DIST_SALIDA_LIBRE_CM = 38;   // Distancia minima para aceptar una ruta lateral como libre
-const int ANGULO_MICRO_BARRIDO  = 20;   // +-20 grados para cubrir el ancho completo del chasis
-const unsigned long TIEMPO_CONFIRMAR_LIBRE_MS = 300; // Espera breve tras finalizar micro-barrido
+const int VEL_OBS_NORMAL        = 95;
+const int VEL_OBS_MINIMA        = 65;
+const long DIST_DESPEJADO_CM    = 100;
+const long DIST_OBSTACULO_CM    = 25;
+const long DIST_SALIDA_LIBRE_CM = 38;
+const int ANGULO_MICRO_BARRIDO  = 20;
+const unsigned long TIEMPO_CONFIRMAR_LIBRE_MS = 300;
 
 // Umbrales Laberinto
 const long DIST_PARED_LAB_CM    = 35;
 const long DIST_SALIDA_LAB_CM   = 115;
 
 // CALIBRAR ESTOS TIEMPOS EN EL PISO REAL:
-const unsigned long TIEMPO_1M_MS                 = 3300; // ms que tarda en avanzar 1 metro a vel 120
-const unsigned long TIEMPO_CELDA_LAB_MS          = 1650; // ms para avanzar 1 celda del laberinto (~50 cm)
-const unsigned long TIEMPO_GIRO_90_MS            = 800;  // ms que tarda en girar 90 grados a vel 160
-const unsigned long TIEMPO_GIRO_180_MS           = 1600; // ms que tarda en girar 180 grados a vel 160
+const unsigned long TIEMPO_1M_MS                 = 3300;
+const unsigned long TIEMPO_CELDA_LAB_MS          = 1650;
+const unsigned long TIEMPO_GIRO_90_MS            = 800;
+const unsigned long TIEMPO_GIRO_180_MS           = 1600;
 const unsigned long TIEMPO_RETROCESO_BLOQUEO_MS  = 550;
 const unsigned long TIEMPO_DESPEJE_GPS_MS        = 1600;
 
@@ -194,15 +196,15 @@ bool enTramoDespejeGps = false;
 unsigned long duracionGiroEv = 0;
 
 int anguloActualRel = 0;
-int nivelAperturaIdx = 0;    // 0: 90°, 1: 135°
-int primerSignoOrden = -1;   // -1 (Izq primero) o +1 (Der primero)
-int intentoEnNivel = 0;      // 0: primer lado elegido, 1: lado opuesto
+int nivelAperturaIdx = 0;
+int primerSignoOrden = -1;
+int intentoEnNivel = 0;
 int signoPreferidoReciente = 0;
 unsigned long timerPreferenciaGiro = 0;
 
 // Variables de micro-barrido de confirmacion (+-20°)
 int anguloBaseBarrido = 0;
-int pasoBarridoIdx = 0;      // 0: -20°, 1: +20°, 2: volver al centro del nuevo rumbo
+int pasoBarridoIdx = 0;
 
 // Odometria relativa e historial circular de ultimas 12 posiciones (en cm)
 const int HIST_OBS_SIZE = 12;
@@ -225,7 +227,7 @@ const int LAB_SIZE = 15;
 uint8_t visitasLab[LAB_SIZE][LAB_SIZE];
 int labX = LAB_SIZE / 2;
 int labY = LAB_SIZE / 2;
-int labDir = 0; // 0: Norte (+Y), 1: Este (+X), 2: Sur (-Y), 3: Oeste (-X)
+int labDir = 0;
 EstadoLaberinto estadoLab = LB_EVALUAR_CELDA;
 int subPasoLab = 0;
 unsigned long timerLab = 0;
@@ -236,7 +238,7 @@ long dFrenteLab = 0, dIzqLab = 0, dDerLab = 0;
 int pasoCircuito = 0;
 unsigned long timerCircuito = 0;
 
-// Seguidor de linea (2 sensores con retencion de curva y kickstart)
+// Seguidor de linea (3 sensores con retencion de curva y kickstart)
 int ultimoLadoLinea = 0;
 unsigned long timerRetencionCurva = 0;
 unsigned long timerKickstartLinea = 0;
@@ -272,8 +274,9 @@ void setLed(bool r, bool g) {
 void actualizarLedEstado() {
   if (modoActual == "LINEA" || (modoActual == "LINEA_OBS" && estadoRodeo == RL_SIGUIENDO_LINEA)) {
     bool izq = (digitalRead(IR_IZQ) == HIGH);
-    bool der = (digitalRead(IR_CEN) == HIGH);
-    bool veLinea = (izq || der);
+    bool cen = (digitalRead(IR_CEN) == HIGH);
+    bool der = (digitalRead(IR_DER) == HIGH);
+    bool veLinea = (izq || cen || der);
     setLed(!veLinea, veLinea);
     return;
   }
@@ -360,7 +363,7 @@ uint8_t leerRegistroLoRaSPI(uint8_t direccion) {
   digitalWrite(SD_CS, HIGH);
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(LORA_CS, LOW);
-  SPI.transfer(direccion & 0x7F); // Bit 7 en 0 indica lectura en SX1278
+  SPI.transfer(direccion & 0x7F);
   uint8_t valor = SPI.transfer(0x00);
   digitalWrite(LORA_CS, HIGH);
   SPI.endTransaction();
@@ -394,11 +397,8 @@ void verificarSaludLoRa() {
   if (ahora - ultimaSaludLoraMs < INTERVALO_SALUD_LORA_MS) return;
   ultimaSaludLoraMs = ahora;
 
-  // 1. Verifica por SPI si el chip SX1278 perdio su SyncWord (0xF3) por micro-caida de voltaje
   uint8_t syncWordLeido = leerRegistroLoRaSPI(0x39);
   bool chipDesconfigurado = (!loraListo || syncWordLeido != 0xF3);
-
-  // 2. Verifica si lleva demasiado tiempo sin recibir paquetes del gateway
   bool silencioProlongado = (ahora - ultimoRxLoraMs >= TIMEOUT_RX_LORA_MS);
 
   if (chipDesconfigurado || silencioProlongado) {
@@ -733,26 +733,62 @@ void ejecutarCircuitoPrueba(long distObs) {
   }
 }
 
-// ================= SEGUIDOR DE LINEA PURO (3.5 CM + KICKSTART + RETENCION) =================
+// ================= SEGUIDOR DE LINEA (3 SENSORES: IZQ=35, CEN=39, DER=36) =================
 void ejecutarSeguidorLinea() {
+  // Cambia HIGH a LOW si tus modulos TCRT5000 entregan 0 al detectar cinta negra
   bool izq = (digitalRead(IR_IZQ) == HIGH);
-  bool der = (digitalRead(IR_CEN) == HIGH);
+  bool cen = (digitalRead(IR_CEN) == HIGH);
+  bool der = (digitalRead(IR_DER) == HIGH);
 
   actualizarLedEstado();
 
-  if (izq && !der) {
+  // 1. Centrado sobre la cinta (solo centro, o los 3 en cruce transversal)
+  if ((!izq && cen && !der) || (izq && cen && der)) {
+    ultimoLadoLinea = 0;
+    timerRetencionCurva = millis();
+
+    if (velActualIzq == 0 && velActualDer == 0 && !kickstartLineaActivo) {
+      kickstartLineaActivo = true;
+      timerKickstartLinea = millis();
+    }
+
+    if (kickstartLineaActivo && (millis() - timerKickstartLinea < DURACION_KICKSTART_MS)) {
+      setMotoresObjetivo(VEL_KICKSTART_LINEA, VEL_KICKSTART_LINEA);
+    } else {
+      kickstartLineaActivo = false;
+      setMotoresObjetivo(VEL_LINEA_RECTO, VEL_LINEA_RECTO);
+    }
+
+  // 2. Desviacion suave a la izquierda (Centro + Izquierda ven cinta)
+  } else if (izq && cen && !der) {
+    ultimoLadoLinea = -1;
+    kickstartLineaActivo = false;
+    timerRetencionCurva = millis();
+    setMotoresObjetivo(VEL_LINEA_SUAVE_INT, VEL_LINEA_SUAVE_EXT);
+
+  // 3. Desviacion suave a la derecha (Centro + Derecha ven cinta)
+  } else if (!izq && cen && der) {
+    ultimoLadoLinea = 1;
+    kickstartLineaActivo = false;
+    timerRetencionCurva = millis();
+    setMotoresObjetivo(VEL_LINEA_SUAVE_EXT, VEL_LINEA_SUAVE_INT);
+
+  // 4. Curva cerrada a la izquierda (solo Izquierda ve cinta)
+  } else if (izq && !cen && !der) {
     ultimoLadoLinea = -1;
     kickstartLineaActivo = false;
     timerRetencionCurva = millis();
     setMotoresObjetivo(VEL_LINEA_GIRO_INT, VEL_LINEA_GIRO_EXT);
 
-  } else if (!izq && der) {
+  // 5. Curva cerrada a la derecha (solo Derecha ve cinta)
+  } else if (!izq && !cen && der) {
     ultimoLadoLinea = 1;
     kickstartLineaActivo = false;
     timerRetencionCurva = millis();
     setMotoresObjetivo(VEL_LINEA_GIRO_EXT, VEL_LINEA_GIRO_INT);
 
-  } else if (izq && der) {
+  // 6. Lectura ambigua (izq y der sin centro) -> mantiene ultimo lado de curva
+  } else if (izq && !cen && der) {
     kickstartLineaActivo = false;
     timerRetencionCurva = millis();
     if (ultimoLadoLinea <= 0) {
@@ -761,6 +797,7 @@ void ejecutarSeguidorLinea() {
       setMotoresObjetivo(VEL_LINEA_GIRO_EXT, VEL_LINEA_GIRO_INT);
     }
 
+  // 7. Ninguno detecta cinta -> retencion de curva por 310 ms o avance con kickstart
   } else {
     if (ultimoLadoLinea != 0 && (millis() - timerRetencionCurva < RETENCION_CURVA_MS)) {
       if (ultimoLadoLinea < 0) {
@@ -789,7 +826,8 @@ void ejecutarSeguidorLinea() {
 // ================= MODO LINEA + OBSTACULOS (RODEO Y REENGANCHE DE CINTA) =================
 void ejecutarLineaConObstaculos(long dist) {
   bool izq = (digitalRead(IR_IZQ) == HIGH);
-  bool der = (digitalRead(IR_CEN) == HIGH);
+  bool cen = (digitalRead(IR_CEN) == HIGH);
+  bool der = (digitalRead(IR_DER) == HIGH);
 
   switch (estadoRodeo) {
     case RL_SIGUIENDO_LINEA:
@@ -880,7 +918,7 @@ void ejecutarLineaConObstaculos(long dist) {
       break;
 
     case RL_BUSCANDO_CINTA:
-      if (izq || der) {
+      if (izq || cen || der) {
         ultimoLadoLinea = 1;
         timerRetencionCurva = millis();
         ultimaOrden = "L_OBS:Linea OK";
@@ -1239,7 +1277,6 @@ void ejecutarEvitadorObstaculos(long dist) {
     case EV_ESPERA_LECTURA:
       if (millis() - timerEv >= 160) {
         if (distanciaActual > DIST_SALIDA_LIBRE_CM) {
-          // Centro libre: inicia micro-barrido (-20° y +20°) para verificar las esquinas del chasis
           anguloBaseBarrido = anguloActualRel;
           pasoBarridoIdx = 0;
           ultimaOrden = "OBS:Barrido -20g";
@@ -1262,7 +1299,6 @@ void ejecutarEvitadorObstaculos(long dist) {
     case EV_BARRIDO_LECTURA:
       if (millis() - timerEv >= 140) {
         if (pasoBarridoIdx == 0) {
-          // Evalua borde izquierdo (-20°)
           if (distanciaActual <= DIST_SALIDA_LIBRE_CM) {
             avanzarSiguienteIntentoEvasion();
           } else {
@@ -1272,7 +1308,6 @@ void ejecutarEvitadorObstaculos(long dist) {
             comandarGiroHacia(anguloBaseBarrido + ANGULO_MICRO_BARRIDO, EV_BARRIDO_GIRAR);
           }
         } else if (pasoBarridoIdx == 1) {
-          // Evalua borde derecho (+20°)
           if (distanciaActual <= DIST_SALIDA_LIBRE_CM) {
             avanzarSiguienteIntentoEvasion();
           } else {
@@ -1280,7 +1315,6 @@ void ejecutarEvitadorObstaculos(long dist) {
             comandarGiroHacia(anguloBaseBarrido, EV_BARRIDO_GIRAR);
           }
         } else if (pasoBarridoIdx == 2) {
-          // Ambas esquinas libres y robot centrado en el nuevo rumbo
           int signoActual = (intentoEnNivel == 0) ? primerSignoOrden : -primerSignoOrden;
           signoPreferidoReciente = signoActual;
           timerPreferenciaGiro = millis();
@@ -1659,7 +1693,7 @@ void setup() {
   #endif
   esp_task_wdt_add(NULL);
 
-  Serial.println("Robot listo. Todos los modos, micro-barrido +-20g y LoRa SPI WDT activos.");
+  Serial.println("Robot listo. Seguidor de linea de 3 sensores (35, 39, 36) y todos los modos activos.");
 }
 
 // ================= LOOP =================
